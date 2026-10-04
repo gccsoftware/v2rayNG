@@ -1,0 +1,446 @@
+# =============================================================================
+# v2rayNG 定制构建 & 发布工作流
+#
+# 两种触发方式：
+#   1. schedule  —— 每天检查上游 2dust/v2rayNG（仓库地址写死）最新的非草稿
+#      versioned Release（注意：上游 CI 把 release 标记为 prerelease，因此不按
+#      prerelease 标记过滤）。若与 state/last_built_upstream_tag 中记录的版本
+#      不同，则拉取该 tag 的源码 → 改包名/图标 → 构建全部签名 APK → 发布
+#      正式 Release，并回写 state 文件。
+#   2. workflow_dispatch —— 手动构建（默认 master，可指定分支/tag）。
+#
+# 本仓库不保存任何 v2rayNG 源码，全部定制都在构建机上对源码的临时副本完成。
+#
+# 包名的传入方式（优先级从高到低）：
+#   1. workflow_dispatch 手动输入 package_name
+#   2. 仓库变量（Settings → Variables）CUSTOM_PACKAGE_NAME
+#   3. 内置默认值 com.renamed.v2rayng
+#
+# 签名（优先级从高到低）：
+#   1. Secrets: APP_KEYSTORE_BASE64 / APP_KEYSTORE_PASSWORD / APP_KEYSTORE_ALIAS /
+#      APP_KEY_PASSWORD（与上游官方同名，长期发布推荐配置）
+#   2. 自动生成的临时 keystore（缓存在 Actions cache 中，跨构建复用；
+#      缓存失效后签名会变，已安装的应用需卸载重装才能更新）
+#
+# 免安装校验：构建完成后自动用 Android SDK 自带 aapt 解包校验每个 APK 的
+# 包名（applicationId）与签名 SHA-256，校验不通过则本次构建失败。
+# =============================================================================
+name: v2rayNG Build & Release
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release
+  cancel-in-progress: true
+
+on:
+  schedule:
+    # 每天 UTC 00:10 检查上游是否有新的正式 Release
+    - cron: "10 0 * * *"
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: "自定义包名 applicationId（如 com.mycorp.vpn）；留空时使用仓库变量 CUSTOM_PACKAGE_NAME"
+        required: false
+        type: string
+        default: ""
+      upstream_ref:
+        description: "上游 2dust/v2rayNG 的分支或 tag"
+        required: false
+        type: string
+        default: "master"
+      release_tag:
+        description: "Release tag（留空自动生成，如 v2.3.10-custom-20261004-1500）"
+        required: false
+        type: string
+        default: ""
+      prerelease:
+        description: "将发布标记为 Pre-release"
+        required: false
+        type: boolean
+        default: true
+
+env:
+  UPSTREAM_REPO: "https://github.com/2dust/v2rayNG.git"
+  UPSTREAM_API: "https://api.github.com/repos/2dust/v2rayNG"
+  UPSTREAM_DIR: "v2rayng-src"
+  DEFAULT_PACKAGE: "com.renamed.v2rayng"
+
+jobs:
+  # ==========================================================================
+  # 解析参数 / 检查上游是否有新版本
+  # ==========================================================================
+  check:
+    name: Check upstream release & resolve config
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.cfg.outputs.should_build }}
+      package: ${{ steps.cfg.outputs.package }}
+      upstream_ref: ${{ steps.cfg.outputs.upstream_ref }}
+      release_tag: ${{ steps.cfg.outputs.release_tag }}
+      make_prerelease: ${{ steps.cfg.outputs.make_prerelease }}
+      upstream_tag: ${{ steps.cfg.outputs.upstream_tag }}
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v7
+
+      - name: Resolve configuration
+        id: cfg
+        shell: bash
+        env:
+          INPUT_PACKAGE: ${{ inputs.package_name }}
+          VARS_PACKAGE: ${{ vars.CUSTOM_PACKAGE_NAME }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # ---- 包名解析（输入 > 变量 > 默认）----
+          PKG="${INPUT_PACKAGE:-${VARS_PACKAGE:-$DEFAULT_PACKAGE}}"
+          if ! [[ "$PKG" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]]; then
+            echo "::error::非法包名 \"$PKG\"：应为小写 Java 形式（如 com.example.vpn），至少两段。"
+            exit 1
+          fi
+          echo "package=$PKG" >> "$GITHUB_OUTPUT"
+
+          # ---- 按触发方式决定构建目标 ----
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "== 定时检查上游 2dust/v2rayNG 最新正式 Release =="
+            TAG=$(curl -sfL --retry 3 "$UPSTREAM_API/releases?per_page=5" \
+              | jq -r '[.[] | select(.draft == false)] | sort_by(.published_at) | last | .tag_name')
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+              echo "::error::未能获取上游 release 信息"
+              exit 1
+            fi
+            LAST=""
+            [ -f state/last_built_upstream_tag ] && LAST=$(tr -d '[:space:]' < state/last_built_upstream_tag)
+            echo "上游最新 release: $TAG；已构建记录: ${LAST:-（无）}"
+            if [ "$TAG" = "$LAST" ]; then
+              echo "无需重新构建，结束。"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            REF="$TAG"                        # 拉取该 release 对应 tag 的源码
+            RTAG="v${TAG#v}-custom"           # 我们的发布 tag，如 v2.3.10-custom
+            PRE="false"                       # 定时构建发布正式 Release
+            UPTAG="$TAG"
+          else
+            REF="${INPUT_REF:-master}"
+            RTAG="${INPUT_TAG}"
+            PRE="${INPUT_PRERELEASE:-true}"
+            UPTAG=""
+          fi
+          {
+            echo "should_build=true"
+            echo "upstream_ref=$REF"
+            echo "release_tag=$RTAG"
+            echo "make_prerelease=$PRE"
+            echo "upstream_tag=$UPTAG"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # ==========================================================================
+  # 定制 + 构建 + 校验 + 发布
+  # ==========================================================================
+  build-release:
+    name: Build & publish APKs
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------------------------
+      - name: Checkout builder repository
+        uses: actions/checkout@v7
+
+      # ------------------------------------------------------------------
+      - name: Clone upstream v2rayNG (with submodules)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --recurse-submodules -j8 \
+            --branch "${{ needs.check.outputs.upstream_ref }}" \
+            "$UPSTREAM_REPO" "$UPSTREAM_DIR" 2>&1 | tail -n 3
+          git -C "$UPSTREAM_DIR" log -1 --format='upstream commit: %H %s (%D)'
+          {
+            echo "UPSTREAM_SHA=$(git -C "$UPSTREAM_DIR" rev-parse HEAD)"
+            echo "HEVTUN_SHA=$(git -C "$UPSTREAM_DIR/hev-socks5-tunnel" rev-parse HEAD)"
+          } >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # 尽量跟随上游官方 workflow 中声明的工具链版本，避免上游升级后构建失败；
+      # 解析不到时使用与本仓库验证一致的固定版本作为兜底。
+      - name: Detect upstream toolchain versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          WF="$UPSTREAM_DIR/.github/workflows/build.yml"
+          NDK=$(grep -oP 'ndk;\K[0-9.]+' "$WF" | head -n1 || true)
+          CMDV=$(grep -oP "cmdline-tools-version:\s*'?\K[0-9]+" "$WF" | head -n1 || true)
+          PKGS=$(grep -oP "packages:\s*'?\K[^']+" "$WF" | head -n1 || true)
+          NDK=${NDK:-30.0.16248370}
+          CMDV=${CMDV:-14742923}
+          PKGS=${PKGS:-"platforms;android-37.0 build-tools;37.0.0 platform-tools"}
+          {
+            echo "ndk_version=$NDK"
+            echo "cmdline_tools_version=$CMDV"
+            echo "sdk_packages=$PKGS"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+          cmdline-tools-version: '${{ steps.tools.outputs.cmdline_tools_version }}'
+          packages: '${{ steps.tools.outputs.sdk_packages }}'
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --channel=0 --install "ndk;${{ steps.tools.outputs.ndk_version }}"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/${{ steps.tools.outputs.ndk_version }}" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      # ------------------------------------------------------------------
+      - name: Restore cached libhevtun
+        id: cache-hevtun
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/${{ env.UPSTREAM_DIR }}/libs
+          key: libhevtun-${{ runner.os }}-${{ steps.tools.outputs.ndk_version }}-${{ env.HEVTUN_SHA }}-${{ hashFiles(format('{0}/compile-hevtun.sh', env.UPSTREAM_DIR)) }}
+
+      - name: Build libhevtun (native tunnel library)
+        if: steps.cache-hevtun.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$UPSTREAM_DIR"
+          bash compile-hevtun.sh
+
+      - name: Save libhevtun cache
+        if: steps.cache-hevtun.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/${{ env.UPSTREAM_DIR }}/libs
+          key: libhevtun-${{ runner.os }}-${{ steps.tools.outputs.ndk_version }}-${{ env.HEVTUN_SHA }}-${{ hashFiles(format('{0}/compile-hevtun.sh', env.UPSTREAM_DIR)) }}
+
+      # ------------------------------------------------------------------
+      - name: Download libv2ray.aar & stage native libs
+        shell: bash
+        run: |
+          set -euo pipefail
+          pushd "$UPSTREAM_DIR/AndroidLibXrayLite" > /dev/null
+          XRAY_TAG="$(git describe --tags --abbrev=0)"
+          popd > /dev/null
+          echo "AndroidLibXrayLite tag: $XRAY_TAG"
+          cp -r "$UPSTREAM_DIR/libs" "$UPSTREAM_DIR/V2rayNG/app/"
+          curl -fL --retry 3 --retry-delay 5 \
+            -o "$UPSTREAM_DIR/V2rayNG/app/libs/libv2ray.aar" \
+            "https://github.com/2dust/AndroidLibXrayLite/releases/download/${XRAY_TAG}/libv2ray.aar"
+          ls -lh "$UPSTREAM_DIR/V2rayNG/app/libs"
+
+      # ------------------------------------------------------------------
+      # 签名 keystore：优先使用仓库 Secrets，否则生成/复用缓存的临时 keystore
+      - name: Restore cached generated keystore
+        id: cache-sign
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.signing
+          key: custom-signing-keystore-v1
+
+      - name: Prepare signing keystore
+        id: keystore
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.APP_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.APP_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.APP_KEYSTORE_ALIAS }}
+          KS_KEY_PASS: ${{ secrets.APP_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KS_FILE="$RUNNER_TEMP/custom.keystore"
+          NEEDS_SAVE=false
+          if [ -n "$KS_B64" ]; then
+            if [ -z "$KS_PASS" ]; then
+              echo "::error::配置了 APP_KEYSTORE_BASE64 但未配置 APP_KEYSTORE_PASSWORD"
+              exit 1
+            fi
+            echo "$KS_B64" | base64 -d > "$KS_FILE"
+            SRC="secrets (APP_KEYSTORE_BASE64)"
+            PASS="$KS_PASS"
+            ALIAS="${KS_ALIAS:-key0}"
+            KEYPASS="${KS_KEY_PASS:-$KS_PASS}"
+          elif [ -f "$GITHUB_WORKSPACE/.signing/custom.keystore" ]; then
+            cp "$GITHUB_WORKSPACE/.signing/custom.keystore" "$KS_FILE"
+            SRC="cached generated keystore"
+            PASS="v2rayng-custom-signing"
+            ALIAS="custom"
+            KEYPASS="v2rayng-custom-signing"
+          else
+            echo "::notice::未配置签名 Secrets，将生成临时 keystore（签名将缓存至 Actions cache 以便后续构建保持一致）"
+            keytool -genkeypair -v -keystore "$KS_FILE" \
+              -alias custom -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass v2rayng-custom-signing -keypass v2rayng-custom-signing \
+              -dname "CN=v2rayNG Custom Build, OU=build, O=custom, L=local, ST=local, C=US"
+            SRC="newly generated keystore"
+            PASS="v2rayng-custom-signing"
+            ALIAS="custom"
+            KEYPASS="v2rayng-custom-signing"
+            mkdir -p "$GITHUB_WORKSPACE/.signing"
+            cp "$KS_FILE" "$GITHUB_WORKSPACE/.signing/custom.keystore"
+            NEEDS_SAVE=true
+          fi
+          echo "签名来源: $SRC"
+          {
+            echo "store_file=$KS_FILE"
+            echo "store_password=$PASS"
+            echo "key_alias=$ALIAS"
+            echo "key_password=$KEYPASS"
+            echo "needs_save=$NEEDS_SAVE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Save generated keystore
+        if: steps.keystore.outputs.needs_save == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.signing
+          key: custom-signing-keystore-v1
+
+      # ------------------------------------------------------------------
+      - name: Install Python dependencies
+        shell: bash
+        run: python3 -m pip install --quiet pillow
+
+      - name: Apply package-name & icon customization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/customize.py \
+            --source "$UPSTREAM_DIR" \
+            --package "${{ needs.check.outputs.package }}" \
+            --icon assets/icon.png \
+            --ndk-version "${{ steps.tools.outputs.ndk_version }}"
+
+      # ------------------------------------------------------------------
+      - name: Build signed APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$UPSTREAM_DIR/V2rayNG"
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          chmod 755 gradlew
+          ./gradlew --no-daemon assembleRelease \
+            -Pandroid.injected.signing.store.file="${{ steps.keystore.outputs.store_file }}" \
+            -Pandroid.injected.signing.store.password="${{ steps.keystore.outputs.store_password }}" \
+            -Pandroid.injected.signing.key.alias="${{ steps.keystore.outputs.key_alias }}" \
+            -Pandroid.injected.signing.key.password="${{ steps.keystore.outputs.key_password }}"
+
+      - name: Collect APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "$UPSTREAM_DIR/V2rayNG/app/build/outputs/apk" -name '*.apk' -exec cp {} dist/ \;
+          test -n "$(ls -A dist)"
+          ls -lh dist/
+
+      # ------------------------------------------------------------------
+      # 免安装校验：aapt 解包读取 applicationId 并比对期望值；同时打印签名指纹
+      - name: Verify APK package name & signature (no install needed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          AAPT=$(ls "$ANDROID_HOME"/build-tools/*/aapt 2>/dev/null | sort -V | tail -n1)
+          SIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n1)
+          [ -x "$AAPT" ] || { echo "::error::未找到 aapt"; exit 1; }
+          EXPECTED="${{ needs.check.outputs.package }}"
+          for apk in dist/*.apk; do
+            NAME=$(basename "$apk")
+            PKG=$("$AAPT" dump badging "$apk" 2>/dev/null | head -n1 | grep -oP "package: name='\K[^']+")
+            printf '  %-42s applicationId=%s\n' "$NAME" "$PKG"
+            if [ "$PKG" != "$EXPECTED" ] && [ "$PKG" != "${EXPECTED}.fdroid" ]; then
+              echo "::error::包名校验失败: $NAME 期望 $EXPECTED（或 .fdroid 后缀），实际 $PKG"
+              exit 1
+            fi
+            "$SIGNER" verify --print-certs "$apk" 2>/dev/null | grep -m1 "SHA-256" | sed 's/^/    /'
+          done
+          echo "::notice::全部 APK 包名 / 签名校验通过"
+
+      # ------------------------------------------------------------------
+      - name: Compute release metadata
+        id: rel
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER=$(grep -oP 'versionName = "\K[^"]+' "$UPSTREAM_DIR/V2rayNG/app/build.gradle.kts")
+          TAG="${{ needs.check.outputs.release_tag }}"
+          TAG="${TAG:-v${VER}-custom-$(date +%Y%m%d-%H%M)}"
+          {
+            echo "version=$VER"
+            echo "tag=$TAG"
+            echo "title=v2rayNG ${VER} – custom (${{ needs.check.outputs.package }})"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.rel.outputs.tag }}"
+          PRE=()
+          if [ "${{ needs.check.outputs.make_prerelease }}" = "true" ]; then
+            PRE=(--prerelease)
+          fi
+
+          {
+            if [ -n "${{ needs.check.outputs.upstream_tag }}" ]; then
+              echo "上游 Release: [\`${{ needs.check.outputs.upstream_tag }}\`](https://github.com/2dust/v2rayNG/releases/tag/${{ needs.check.outputs.upstream_tag }})（每日自动检查触发）"
+            fi
+            echo "上游 2dust/v2rayNG: \`${{ env.UPSTREAM_SHA }}\` (ref: \`${{ needs.check.outputs.upstream_ref }}\`)"
+            echo "包名 applicationId: \`${{ needs.check.outputs.package }}\`（fdroid flavor 自动追加 \`.fdroid\` 后缀）"
+            echo "启动器图标: 自定义（assets/icon.png）"
+            echo ""
+            echo "本 Release 由工作流自动构建并发布，APK 已签名，包名/签名已在构建日志中校验（无需安装）。"
+            for apk in dist/*.apk; do echo "- \`$(basename "$apk")\`"; done
+          } > release-notes.md
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG 已存在，追加/覆盖上传 APK"
+            gh release upload "$TAG" dist/*.apk --clobber
+          else
+            gh release create "$TAG" dist/*.apk \
+              --title "${{ steps.rel.outputs.title }}" \
+              --notes-file release-notes.md \
+              "${PRE[@]}"
+          fi
+          gh release view "$TAG" --json url --jq .url
+
+      # ------------------------------------------------------------------
+      # 定时任务：构建成功后回写已处理的上游 release tag，避免重复构建
+      - name: Record built upstream tag
+        if: github.event_name == 'schedule' && needs.check.outputs.upstream_tag != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p state
+          echo "${{ needs.check.outputs.upstream_tag }}" > state/last_built_upstream_tag
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/last_built_upstream_tag
+          if git diff --cached --quiet; then
+            echo "state 文件无变化"
+          else
+            git commit -m "chore(state): built upstream release ${{ needs.check.outputs.upstream_tag }}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            echo "已记录上游 release ${{ needs.check.outputs.upstream_tag }} 到 state/last_built_upstream_tag"
+          fi
